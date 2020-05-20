@@ -1,0 +1,463 @@
+---
+title: "Inferring motifs from TET+ data and building motif PWMs"
+author: "M.S. & co"
+date: "18/5/2020"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(data.table)
+library(stringr)
+library(stringdist)
+library(ggrepel)
+library(forcats)
+library(reshape2)
+library(cowplot)
+library(igraph)
+library(ggplot2)
+library(tidyr)
+library(broom)
+library(ggpubr)
+library(ggseqlogo)
+library(ggsci)
+library(parallel)
+select = dplyr::select
+```
+
+## Export VDJdb to VDJtools format
+
+Load latest DB for human
+
+```{r}
+df.vdjdb.full <- fread("tetramer.txt")
+df.vdjdb <- df.vdjdb.full %>%
+  mutate(v.segm = gsub("DV", "/DV", v.segm)) %>%
+  mutate(v.segm = gsub("//", "/", v.segm)) %>%
+  mutate(species = "HomoSapiens") %>%
+  select(cdr3, v.segm, j.segm, antigen.epitope, gene, species) %>%
+  unique
+
+df.vdjdb %>%
+  .$antigen.epitope %>%
+  unique
+```
+
+Select epitopes
+
+```{r}
+dt.epi.count = df.vdjdb %>%
+  group_by(species, gene, antigen.epitope) %>%
+  summarise(total = n()) %>%
+  arrange(-total)
+
+dt.epi.count %>% head(n = 10)
+
+df.vdjdb.good = df.vdjdb %>%
+  merge(dt.epi.count %>% filter(total >= 10))
+```
+
+### Check V usage and CDR3 length differences 
+
+```{r}
+rbind(
+  fread("pools/human.tra.aa.txt") %>% mutate(gene = "TRA"),
+  fread("pools/human.trb.aa.txt") %>% mutate(gene = "TRB")
+  ) -> pools
+
+pools %>%
+  mutate(v = gsub("DV", "/DV", v)) %>%
+  mutate(v = gsub("//", "/", v)) %>%
+  group_by(gene, v) %>%
+  summarize(count = length(unique(cdr3aa))) %>%
+  group_by(gene) %>%
+  mutate(freq = count / sum(count),
+         type = "Control") -> v.usage
+
+pools %>%
+  mutate(cdr3.len = nchar(cdr3aa)) %>%
+  group_by(gene, cdr3.len) %>%
+  summarize(count = length(unique(cdr3aa))) %>%
+  group_by(gene) %>%
+  mutate(freq = count / sum(count),
+         type = "Control") -> spectra
+```
+
+```{r}
+rbind(
+  df.vdjdb.good %>%
+    mutate(v = v.segm, cdr3aa = cdr3) %>%
+    group_by(gene, v, type = antigen.epitope) %>%
+    summarize(count = length(unique(cdr3aa))) %>%
+    group_by(gene, type) %>%
+    mutate(freq = count / sum(count)),
+  v.usage) -> v.usage.2
+
+v.usage.2 %>%
+  filter(v == "TRAV12-1")
+v.usage.2 %>%
+  filter(v == "TRAV13-2")
+v.usage.2 %>%
+  filter(v == "TRBV7-9")
+v.usage.2 %>%
+  filter(v == "TRBV6-5")
+
+rbind(
+  df.vdjdb.good %>%
+    mutate(cdr3.len = nchar(cdr3)) %>%
+    group_by(gene, cdr3.len, type = antigen.epitope) %>%
+    summarize(count = length(unique(cdr3))) %>%
+    group_by(gene, type) %>%
+    mutate(freq = count / sum(count)),
+  spectra) -> spectra.2
+```
+
+```{r}
+spectra.2 %>%
+  ggplot(aes(x = cdr3.len, y = freq, color = type)) +
+  annotate("rect", xmin = 15+ 0.5, xmax = 21+ 0.5, ymin = 0.3, ymax = 0.50, fill = "grey95") +
+  geom_line(size = 1) +
+  geom_text(data = spectra.2 %>%
+              group_by(gene, type) %>%
+              summarise(cdr3.len.m = sum(cdr3.len * freq)) %>%
+              ungroup %>%
+              mutate(type.1 = type %>% as.factor %>% as.integer),
+            aes(x = 18 + 0.5, y = 0.3 + type.1 * 0.05, label = paste0("L=",round(cdr3.len.m, 1))),
+            size = 5) +
+  scale_x_continuous(limits = c(8, 22)) +
+  facet_wrap(~gene) + xlab("CDR3 length") + ylab("Frequency") +
+  scale_color_brewer(name = "", palette = "Set1") +
+  theme_pubr() +
+  theme(legend.position = "bottom") -> p_spectra
+p_spectra
+
+v.usage.2 %>%
+  mutate(v = gsub("TRA", "", v)) %>%
+  mutate(v = gsub("TRB", "", v)) %>%
+  filter(v != "TR/DV1") %>% # TRDV contamination
+  filter(freq > 0.01) %>%
+  ggplot(aes(x = v %>% fct_reorder2(type, -freq), y = freq, color = type)) +
+  geom_segment(aes(xend = v %>% fct_reorder2(type, -freq), 
+                   y = 0, yend = freq),
+               alpha = 0.5, size = 3) +
+  geom_point(size = 3) +
+  coord_flip() + xlab("") + ylab("Frequency") +
+  scale_color_brewer(name = "", palette = "Set1") +
+  facet_wrap(~gene, scales = "free") +
+  theme_pubr() +
+  theme(legend.position = "bottom") -> p_vusage
+p_vusage
+```
+
+### Continue with motif analysis / TCRNET
+
+Back translate mock functions
+
+```{r}
+mock_codons <- c('GCT', 'TGT', 'GAT', 'GAA', 'TTT',
+                 'GGT', 'ATT', 'CAT', 'AAA', 'TTA',
+                 'ATG', 'AAT', 'CCT', 'CAA', 'CGT',
+                 'TCT', 'ACT', 'GTT', 'TGG', 'TAT')
+
+names(mock_codons) <- c('A', 'C', 'D', 'E', 'F',
+                        'G', 'I', 'H', 'K', 'L',
+                        'M', 'N', 'P', 'Q', 'R',
+                        'S', 'T', 'V', 'W', 'Y')
+
+mock_back_translate <- function(x) {
+  paste0(mock_codons[x], collapse = "")
+}
+```
+
+Convert to VDJtools format
+
+```{r}
+df.vdjtools <- df.vdjdb.good %>%
+  mutate(count = 1,
+         cdr3aa = cdr3,
+         cdr3nt = cdr3 %>% 
+           strsplit('') %>% 
+           lapply(mock_back_translate),
+         v = v.segm, d = "", j = j.segm,
+         vend = -1, dstart = -1, dend = -1, jstart = -1) %>%
+  group_by(gene, antigen.epitope, species) %>%
+  mutate(freq = count / sum(count)) %>%
+  select(count, freq, cdr3nt, cdr3aa, v, d, j, vend, dstart, dend, jstart, 
+         gene, antigen.epitope, species)
+```
+
+Write separate VDJtools file for each epitope
+
+```{r}
+system("mkdir vdjdb_export/")
+
+df.vdjtools %>%
+  group_by(gene, antigen.epitope, species) %>%
+  do(data.frame(
+    fwrite(., paste0("vdjdb_export/", .$species[1], ".",
+                     .$gene[1], ".", .$antigen.epitope[1], ".txt"), sep = "\t", quote = F)
+    ))
+```
+
+## Run TCRNET
+
+List VDJdb split files
+
+```{r}
+filenames <- list.files("vdjdb_export/")
+tmp <- str_split_fixed(filenames, fixed("."), 4)[,1:3]
+df.files <- data.frame(file.name = filenames, species = tmp[,1], gene = tmp[,2]) %>%
+  mutate(species = ifelse(species == "HomoSapiens", "human", "mouse"),
+         gene = tolower(gene)) %>%
+  mutate(input = paste0("vdjdb_export/", file.name),
+         background = paste0("pools/", species, ".", gene, ".aa.txt"))
+```
+
+Run TCRNET via vdjtools
+         
+```
+df.files %>%
+  group_by(background) %>%
+  summarise(cmd = paste0("/software/bin/vdjtools -Xmx100G CalcDegreeStats -o 1,0,1 -g2 dummy -b ",
+         background[1], " ", paste(input, collapse = " "), " tcrnet/")) %>%
+  group_by(background) %>%
+  do(data.frame(system(.$cmd)))
+```
+
+Load results
+
+```{r}
+df.tcrnet <- filenames %>%
+  lapply(function(x) fread(paste0("tcrnet/", x)) %>%
+                             mutate(file.name = x)) %>%
+  rbindlist %>%
+  merge(data.frame(file.name = filenames, 
+                   species = tmp[,1], 
+                   gene = tmp[,2],
+                   antigen.epitope = tmp[,3]))
+```
+
+Adjust P-values and select enriched variants
+
+```{r}
+df.tcrnet <- df.tcrnet %>%
+  group_by(species, gene, antigen.epitope) %>%
+  mutate(p.adj = p.value.g) %>%
+  ungroup %>%
+  mutate(enriched = degree.s >= 2 & p.adj < 0.05)
+```
+
+## Analyze CDR3 graphs
+
+Build hamming graph around enriched CDR3s
+
+```{r}
+compute_edges <- function(cdr3.1, cdr3.2, combine) {
+  if (combine) {
+    cdr3.1 <- c(cdr3.1, cdr3.2) %>% unique
+    cdr3.2 <- cdr3.1
+  }
+  
+  stringdistmatrix(cdr3.1, cdr3.2, 
+                   method = "hamming", 
+                   nthread = 80,
+                   useNames = "strings") %>%
+    as.matrix %>%
+    melt %>% 
+    filter(value == 1) %>%
+    mutate(cdr3.from = as.character(Var1), 
+           cdr3.to = as.character(Var2)) %>%
+    select(-Var1, -Var2, -value) %>%
+    unique
+}
+
+# I - between enriched and neighbors
+df.graph.e <- df.tcrnet %>%
+  group_by(species, gene, antigen.epitope) %>%
+  do(compute_edges(.$cdr3aa[which(.$enriched)], .$cdr3aa, F)) %>%
+  ungroup
+
+# II - between all from previous graph
+df.graph <- df.graph.e %>%
+  group_by(species, gene, antigen.epitope) %>%
+  do(compute_edges(.$cdr3.from, .$cdr3.to, T)) %>%
+  ungroup
+```
+
+Select connected componenets/clusters with motifs. We select everything with at least $N=10$ members
+
+```{r}
+compute_cc <- function(from, to) {
+  set.seed(123)
+  gg <- data.frame(from, to) %>%
+    graph_from_data_frame %>%
+    simplify
+  
+  cc <- gg %>%
+    clusters
+  
+  coords <- gg %>%
+      layout_with_graphopt(niter = 3000, charge = 0.005)
+  
+  data.frame(cdr3aa = names(V(gg)),
+             x = coords[,1],
+             y = coords[,2],
+             stringsAsFactors = F) %>%
+    merge(data.frame(cdr3aa = names(cc$membership),
+                 cid = cc$membership,
+                 stringsAsFactors = F))
+}
+
+df.cc <- df.graph %>%
+  group_by(species, gene, antigen.epitope) %>%
+  do(compute_cc(.$cdr3.from, .$cdr3.to)) %>%
+  ungroup %>%
+  mutate(cid = paste(substr(species, 1, 1),
+                     substr(gene, 3, 3),
+                     antigen.epitope,
+                     cid, sep = ".")) %>%
+  group_by(cid) %>%
+  mutate(csz = n()) %>%
+  ungroup
+
+most_freq_segm <- function(segm) {
+  segm <- str_split_fixed(segm, ",", 2)[,1]
+  names(sort(table(segm), decreasing=T))[1]
+}
+
+df.cc <- df.cc %>%
+  merge(df.vdjdb %>% 
+          mutate(cdr3aa = cdr3) %>% 
+          filter(cdr3aa %in% df.cc$cdr3aa) %>%
+          select(-cdr3)) %>%
+  group_by(cid) %>%
+  # select representative V/J
+  mutate(v.segm.repr = most_freq_segm(v.segm), 
+         j.segm.repr = most_freq_segm(j.segm)) %>%
+  ungroup
+
+df.cc %>% .$cid %>% unique
+
+df.cc.sel <- df.cc %>%
+  filter(csz >= 10)
+
+df.cc.sel %>% .$cid %>% unique
+```
+
+### Final plot
+
+Plot CDR3 similarity map for clusters
+
+```{r}
+df.cc.sel <- df.cc.sel %>%
+  group_by(cid) %>%
+  mutate(x.c = mean(x),
+         y.c = mean(y),
+         dist.c = (x - x.c)^2 + (y - y.c)^2,
+         dist.c.r = rank(dist.c)) %>%
+  ungroup %>%
+  mutate(cid.text = str_replace(cid, "H\\.", "TR") %>%
+           str_replace("YLQPRTFLL", "YLQ"))
+
+p_clusters2 <- df.cc.sel %>%
+  ggplot(aes(x = x, y = y, color = cid.text)) +
+  geom_density_2d(h=c(300, 300)) +
+  geom_point() +
+  geom_text_repel(data = df.cc.sel %>% filter(dist.c.r <= 5),
+                  aes(label = cdr3aa), 
+                  min.segment.length = 0, segment.alpha = 0.5,
+                  color = "black", cex = 2.5) +
+  xlab("") + ylab("") +
+  scale_color_brewer(name= "", guide = F, palette = "Set2") +
+  facet_wrap( ~ gene, scales = "free") +
+  theme_pubr() +
+  theme(aspect = 1,
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) #+
+  #guides(col = guide_legend(nrow = 2, byrow = T))
+p_clusters2
+```
+
+Plot frequency in donors for each cluster
+
+```{r}
+df.cc.sel %>%
+  mutate(cdr3 = cdr3aa) %>%
+  merge(df.vdjdb.full %>% filter(antigen.epitope == "YLQPRTFLL")) %>%
+  group_by(gene, cid.text, meta.donor.id) %>%
+  summarise(freq = sum(method.frequency)) -> df.cc.freq
+
+df.cc.freq %>%
+  filter(gene == "TRA") %>%
+  merge(df.cc.freq %>%
+          filter(gene == "TRB"), by = "meta.donor.id", all = T) %>%
+  mutate(freq.x = ifelse(is.na(freq.x), 0, freq.x),
+         freq.y = ifelse(is.na(freq.y), 0, freq.y)) %>%
+  group_by(cid.text.x, cid.text.y) %>%
+  do(cor.test(.$freq.x, .$freq.y) %>% tidy)
+
+# TRA.YLQ.1 and TRB.YLQ.4 both missing in donor p1445 and pLTI1494
+
+df.cc.freq %>%
+  ggplot(aes(x = meta.donor.id, y = freq, fill = cid.text,)) +
+  #geom_path(aes(group = cid.text)) +
+  geom_bar(aes(group = gene), stat = "identity", position = "dodge",
+           color = "black", size = 0.4, width = 0.6) +
+  xlab("") + ylab("Frequency in tet+") +
+  scale_fill_brewer(name = "", palette = "Set2") +
+  theme_pubr() +
+  facet_grid(gene~.) +
+  guides(col = guide_legend(nrow = 2, byrow = T)) -> p_pairing
+
+p_pairing
+```
+
+Plot PWMs
+
+```{r fig.height=6, fig.width=10}
+p_logo <- plot_grid(plotlist = df.cc.sel %>%
+                      group_by(cid.text) %>%
+                      group_map(~ggseqlogo(.x$cdr3aa) +
+                                  ggtitle(.y) + 
+                                  theme(legend.position = "none",
+                                        axis.title.y = element_blank(),
+                                        axis.text.y = element_blank())),
+                    ncol = 3)
+p_logo
+
+df.cc %>%
+  filter(antigen.epitope == "RLQSLQTYV") %>%
+  arrange(cid)
+```
+
+Combine together & output
+
+```{r}
+df.cc.sel %>% fwrite("YLQPRTFLL_motif.txt", sep = "\t")
+
+
+pdf("YLQPRTFLL_motif_d.pdf", height = 4, width = 6)
+p_spectra
+dev.off()
+pdf("YLQPRTFLL_motif_e.pdf", height = 7, width = 6)
+p_vusage
+dev.off()
+
+
+pdf("YLQPRTFLL_motif_a.pdf", height = 5, width = 7)
+p_clusters2
+dev.off()
+pdf("YLQPRTFLL_motif_b.pdf", height = 4, width = 7)
+p_pairing
+dev.off()
+pdf("YLQPRTFLL_motif_c.pdf", height = 4, width = 7)
+p_logo
+dev.off()
+```
+
+```{r}
+#
+```
